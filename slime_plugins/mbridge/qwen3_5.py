@@ -36,6 +36,20 @@ class Qwen3_5Bridge(Qwen2MoEBridge):
             "model.language_model.layers.{layer_number}.self_attn.k_proj.bias",
             "model.language_model.layers.{layer_number}.self_attn.v_proj.bias",
         ],
+        # Newer Megatron versions use linear_qgkv for GQA models
+        "self_attention.linear_qgkv.layer_norm_weight": [
+            "model.language_model.layers.{layer_number}.input_layernorm.weight"
+        ],
+        "self_attention.linear_qgkv.weight": [
+            "model.language_model.layers.{layer_number}.self_attn.q_proj.weight",
+            "model.language_model.layers.{layer_number}.self_attn.k_proj.weight",
+            "model.language_model.layers.{layer_number}.self_attn.v_proj.weight",
+        ],
+        "self_attention.linear_qgkv.bias": [
+            "model.language_model.layers.{layer_number}.self_attn.q_proj.bias",
+            "model.language_model.layers.{layer_number}.self_attn.k_proj.bias",
+            "model.language_model.layers.{layer_number}.self_attn.v_proj.bias",
+        ],
     } | {
         f"self_attention.{weight_name}": ["model.language_model.layers.{layer_number}." + weight_name]
         for weight_name in [
@@ -196,7 +210,7 @@ class Qwen3_5Bridge(Qwen2MoEBridge):
     def _weight_to_mcore_format(
         self, mcore_weights_name: str, hf_weights: list[torch.Tensor]
     ) -> tuple[list[str], list[torch.Tensor]]:
-        if "self_attention.linear_qkv." in mcore_weights_name and "layer_norm" not in mcore_weights_name:
+        if ("self_attention.linear_qkv." in mcore_weights_name or "self_attention.linear_qgkv." in mcore_weights_name) and "layer_norm" not in mcore_weights_name:
             # merge qkv
             assert len(hf_weights) == 3
             text_config = self._get_text_config()
