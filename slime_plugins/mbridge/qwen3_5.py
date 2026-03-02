@@ -269,7 +269,6 @@ class Qwen3_5Bridge(Qwen2MoEBridge):
             # Qwen3.5 specific
             moe_router_pre_softmax=False,
             qk_layernorm=True,
-            attention_output_gate=True,
             **mtp_args,
         )
 
