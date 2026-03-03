@@ -199,12 +199,39 @@ class Qwen3_5ForConditionalGeneration(Qwen3NextForCausalLM):
 
             yield name, weight
 
-        for layer in sorted(pending_qkv):
+        # Merge buffered projections. During RL weight updates, weights arrive
+        # in chunks so a layer's QKV and Z may land in different calls. When
+        # one half is missing, read the current value from the model.
+        all_qkvz_layers = set(pending_qkv) | set(pending_z)
+        for layer in sorted(all_qkvz_layers):
+            qkv = pending_qkv.get(layer)
+            z = pending_z.get(layer)
+            if qkv is None or z is None:
+                cur = self._get_param(f"model.layers.{layer}.linear_attn.in_proj_qkvz.weight")
+                cur_qkv, cur_z = self._split_qkvz(cur)
+                qkv = qkv if qkv is not None else cur_qkv
+                z = z if z is not None else cur_z
             yield f"model.layers.{layer}.linear_attn.in_proj_qkvz.weight", \
-                self._merge_qkvz(pending_qkv[layer], pending_z[layer])
-        for layer in sorted(pending_b):
+                self._merge_qkvz(qkv, z)
+
+        all_ba_layers = set(pending_b) | set(pending_a)
+        for layer in sorted(all_ba_layers):
+            b = pending_b.get(layer)
+            a = pending_a.get(layer)
+            if b is None or a is None:
+                cur = self._get_param(f"model.layers.{layer}.linear_attn.in_proj_ba.weight")
+                cur_b, cur_a = self._split_ba(cur)
+                b = b if b is not None else cur_b
+                a = a if a is not None else cur_a
             yield f"model.layers.{layer}.linear_attn.in_proj_ba.weight", \
-                self._merge_ba(pending_b[layer], pending_a[layer])
+                self._merge_ba(b, a)
+
+    def _get_param(self, name: str) -> torch.Tensor:
+        """Look up an existing model parameter by name."""
+        for n, p in self.named_parameters():
+            if n == name:
+                return p.data
+        raise KeyError(f"Parameter {name} not found in model")
 
     def _merge_qkvz(self, qkv_weight, z_weight):
         cfg = self.config
@@ -218,6 +245,23 @@ class Qwen3_5ForConditionalGeneration(Qwen3NextForCausalLM):
         z = z_weight.view(num_k, v_per_k * dv, -1)
         return torch.cat([q, k, v, z], dim=1).reshape(-1, qkv_weight.shape[1]).contiguous()
 
+    def _split_qkvz(self, qkvz_weight):
+        """Reverse of _merge_qkvz: split interleaved [Q_g,K_g,V_g,Z_g] back to flat [Q,K,V] and [Z]."""
+        cfg = self.config
+        num_k, num_v = cfg.linear_num_key_heads, cfg.linear_num_value_heads
+        dk, dv = cfg.linear_key_head_dim, cfg.linear_value_head_dim
+        v_per_k = num_v // num_k
+        hidden = qkvz_weight.shape[1]
+        # Grouped layout: per group [dk, dk, v_per_k*dv, v_per_k*dv]
+        group_size = dk + dk + v_per_k * dv + v_per_k * dv
+        groups = qkvz_weight.view(num_k, group_size, hidden)
+        q = groups[:, :dk, :].reshape(-1, hidden)
+        k = groups[:, dk:2*dk, :].reshape(-1, hidden)
+        v = groups[:, 2*dk:2*dk + v_per_k*dv, :].reshape(-1, hidden)
+        z = groups[:, 2*dk + v_per_k*dv:, :].reshape(-1, hidden)
+        qkv = torch.cat([q, k, v], dim=0).contiguous()
+        return qkv, z.contiguous()
+
     def _merge_ba(self, b_weight, a_weight):
         cfg = self.config
         num_k = cfg.linear_num_key_heads
@@ -225,6 +269,17 @@ class Qwen3_5ForConditionalGeneration(Qwen3NextForCausalLM):
         b = b_weight.view(num_k, v_per_k, -1)
         a = a_weight.view(num_k, v_per_k, -1)
         return torch.cat([b, a], dim=1).reshape(-1, b_weight.shape[1]).contiguous()
+
+    def _split_ba(self, ba_weight):
+        """Reverse of _merge_ba: split interleaved [B_g,A_g] back to flat [B] and [A]."""
+        cfg = self.config
+        num_k = cfg.linear_num_key_heads
+        v_per_k = cfg.linear_num_value_heads // num_k
+        hidden = ba_weight.shape[1]
+        groups = ba_weight.view(num_k, 2 * v_per_k, hidden)
+        b = groups[:, :v_per_k, :].reshape(-1, hidden)
+        a = groups[:, v_per_k:, :].reshape(-1, hidden)
+        return b.contiguous(), a.contiguous()
 
 
 EntryClass = Qwen3_5ForConditionalGeneration
