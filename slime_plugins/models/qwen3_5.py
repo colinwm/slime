@@ -185,7 +185,8 @@ class Attention(HuggingfaceAttention):
 
         self.linear_attn = Qwen3_5GatedDeltaNet(self.hf_config, self.hf_layer_idx)
 
-        # Use a simple RMSNorm
+        # Use a simple RMSNorm (TransformerLayer's input_layernorm is IdentityOp,
+        # so this module is the only layernorm before linear attention)
         try:
             from transformers.models.qwen3_next.modeling_qwen3_next import Qwen3NextRMSNorm
 

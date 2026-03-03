@@ -54,8 +54,13 @@ class HuggingfaceAttention(MegatronModule, ABC):
         cu_seqlens = packed_seq_params.cu_seqlens_q
 
         if self.args.sequence_parallel:
+            # tensor_parallel_output_grad=False because the HF attention has
+            # replicated (not TP-sharded) weights, so all ranks compute the
+            # same output.  The backward should split (not reduce-scatter) to
+            # avoid amplifying gradients by the TP world-size.
             hidden_states = tensor_parallel.gather_from_sequence_parallel_region(
-                hidden_states, group=mpu.get_tensor_model_parallel_group()
+                hidden_states, tensor_parallel_output_grad=False,
+                group=mpu.get_tensor_model_parallel_group()
             )
 
         if mpu.get_context_parallel_world_size() > 1:
