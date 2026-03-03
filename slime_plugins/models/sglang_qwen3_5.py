@@ -171,6 +171,10 @@ class Qwen3_5ForConditionalGeneration(Qwen3NextForCausalLM):
         pending_qkv, pending_z, pending_b, pending_a = {}, {}, {}, {}
 
         for name, weight in weights:
+            # Skip visual/VLM-only weights not present in the text model
+            if "visual." in name or "multi_modal_projector." in name:
+                continue
+
             name = name.replace("model.language_model.", "model.")
 
             # Handle tied embeddings: duplicate embed_tokens -> lm_head
