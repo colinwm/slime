@@ -67,9 +67,9 @@ def _make_dense_layer_class(base_class):
                 elif v is not None:
                     setattr(config, k, v)
 
-            # Replace MoE MLP with dense MLP
+            # Replace MoE MLP with dense MLP wrapped to match MoE forward signature
             self.is_layer_sparse = False
-            self.mlp = _qn.Qwen2MoeMLP(
+            self.mlp = _DenseMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
@@ -79,6 +79,18 @@ def _make_dense_layer_class(base_class):
     _DenseLayer.__name__ = f"Dense{base_class.__name__}"
     _DenseLayer.__qualname__ = _DenseLayer.__name__
     return _DenseLayer
+
+
+class _DenseMLP(_qn.Qwen2MoeMLP):
+    """Dense MLP with forward signature matching Qwen2MoeSparseMoeBlock.
+
+    The parent layer calls mlp(hidden_states, forward_batch, use_reduce_scatter).
+    Qwen2MoeMLP.forward expects (x, should_allreduce_fusion, use_reduce_scatter),
+    so without this wrapper, forward_batch (a truthy object) is interpreted as
+    should_allreduce_fusion=True, which skips the TP all-reduce and breaks multi-GPU.
+    """
+    def forward(self, hidden_states, forward_batch=None, use_reduce_scatter=False):
+        return super().forward(hidden_states, use_reduce_scatter=use_reduce_scatter)
 
 
 class Qwen3_5ForConditionalGeneration(Qwen3NextForCausalLM):
@@ -166,34 +178,7 @@ class Qwen3_5ForConditionalGeneration(Qwen3NextForCausalLM):
     # ------------------------------------------------------------------
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_mtp=False) -> Set[str]:
         transformed = list(self._transform_weights(weights))
-        logger.info(
-            "load_weights: yielded %d weights, sample names: %s",
-            len(transformed),
-            [n for n, _ in transformed[:5]],
-        )
-        # Check a reference param before/after to detect silent no-ops
-        ref_param = None
-        for n, p in self.named_parameters():
-            if "embed_tokens" in n:
-                ref_param = (n, p.data[:3].clone())
-                break
         loaded = super().load_weights(iter(transformed), is_mtp=is_mtp)
-        logger.info("load_weights: parent loaded %d params", len(loaded) if loaded else -1)
-        if ref_param:
-            for n, p in self.named_parameters():
-                if n == ref_param[0]:
-                    diff = (p.data[:3] - ref_param[1]).abs().max().item()
-                    logger.info("load_weights: %s max_diff=%.6f", n, diff)
-                    break
-        # Log any orphaned buffers
-        if self._buf_qkv:
-            logger.warning("Orphaned _buf_qkv layers: %s", sorted(self._buf_qkv))
-        if self._buf_z:
-            logger.warning("Orphaned _buf_z layers: %s", sorted(self._buf_z))
-        if self._buf_b:
-            logger.warning("Orphaned _buf_b layers: %s", sorted(self._buf_b))
-        if self._buf_a:
-            logger.warning("Orphaned _buf_a layers: %s", sorted(self._buf_a))
         return loaded
 
     def _transform_weights(self, weights):
@@ -204,21 +189,10 @@ class Qwen3_5ForConditionalGeneration(Qwen3NextForCausalLM):
             self._buf_qkv, self._buf_z = {}, {}
             self._buf_b, self._buf_a = {}, {}
 
-        n_in = 0
-        n_skip = 0
-        n_buf = 0
-        n_yield = 0
-        n_merge = 0
-        sample_names = []
-
         for name, weight in weights:
-            n_in += 1
-            if n_in <= 5:
-                sample_names.append(f"{name} {tuple(weight.shape)}")
 
             # Skip visual/VLM-only weights not present in the text model
             if "visual." in name or "multi_modal_projector." in name:
-                n_skip += 1
                 continue
 
             name = name.replace("model.language_model.", "model.")
@@ -232,41 +206,29 @@ class Qwen3_5ForConditionalGeneration(Qwen3NextForCausalLM):
 
             if ".linear_attn.in_proj_qkv." in name:
                 self._buf_qkv[layer] = weight
-                n_buf += 1
                 continue
             if ".linear_attn.in_proj_z." in name:
                 self._buf_z[layer] = weight
-                n_buf += 1
                 continue
             if ".linear_attn.in_proj_b." in name:
                 self._buf_b[layer] = weight
-                n_buf += 1
                 continue
             if ".linear_attn.in_proj_a." in name:
                 self._buf_a[layer] = weight
-                n_buf += 1
                 continue
 
-            n_yield += 1
             yield name, weight
 
         # Yield merged projections only when both halves are available.
         complete = set(self._buf_qkv) & set(self._buf_z)
         for layer in sorted(complete):
-            n_merge += 1
             yield f"model.layers.{layer}.linear_attn.in_proj_qkvz.weight", \
                 self._merge_qkvz(self._buf_qkv.pop(layer), self._buf_z.pop(layer))
 
         complete = set(self._buf_b) & set(self._buf_a)
         for layer in sorted(complete):
-            n_merge += 1
             yield f"model.layers.{layer}.linear_attn.in_proj_ba.weight", \
                 self._merge_ba(self._buf_b.pop(layer), self._buf_a.pop(layer))
-
-        logger.info(
-            "_transform_weights: in=%d skip=%d buf=%d yield=%d merge=%d | samples: %s",
-            n_in, n_skip, n_buf, n_yield, n_merge, sample_names,
-        )
 
     def _merge_qkvz(self, qkv_weight, z_weight):
         cfg = self.config
