@@ -264,6 +264,44 @@ class Qwen3_5Bridge(Qwen2MoEBridge):
         if mcore_weights_name.endswith("eh_proj.weight"):
             first_half, second_half = mcore_weights.chunk(2, dim=1)
             mcore_weights = torch.cat([second_half, first_half], dim=1)
+
+        # Reverse the gated-Q interleaving done in _weight_to_mcore_format.
+        # The parent class doesn't know about the attention_output_gate's
+        # factor-of-2 in Q, so we do the full QGKV split here.
+        if ("self_attention.linear_qkv." in mcore_weights_name or "self_attention.linear_qgkv." in mcore_weights_name) and "layer_norm" not in mcore_weights_name:
+            text_config = self._get_text_config()
+            num_key_value_heads = text_config.num_key_value_heads
+            hidden_dim = text_config.hidden_size
+            num_attention_heads = text_config.num_attention_heads
+            num_querys_per_group = num_attention_heads // num_key_value_heads
+            head_dim = getattr(text_config, "head_dim", hidden_dim // num_attention_heads)
+
+            is_bias = ".bias" in mcore_weights_name
+            if is_bias:
+                grouped = mcore_weights.view(num_key_value_heads, -1)
+            else:
+                grouped = mcore_weights.view(num_key_value_heads, -1, hidden_dim)
+
+            k_dim = head_dim
+            v_dim = head_dim
+            q_dim = grouped.shape[1] - k_dim - v_dim
+
+            q = grouped[:, :q_dim, ...] if not is_bias else grouped[:, :q_dim]
+            k = grouped[:, q_dim:q_dim + k_dim, ...] if not is_bias else grouped[:, q_dim:q_dim + k_dim]
+            v = grouped[:, q_dim + k_dim:, ...] if not is_bias else grouped[:, q_dim + k_dim:]
+
+            # Un-interleave Q: reverse of .view(kvh, qpg, 2, hd, ...).transpose(1,2).flatten(1,3)
+            if is_bias:
+                q = q.view(num_key_value_heads, 2, num_querys_per_group, head_dim).transpose(1, 2).reshape(-1)
+                k = k.reshape(-1)
+                v = v.reshape(-1)
+            else:
+                q = q.view(num_key_value_heads, 2, num_querys_per_group, head_dim, hidden_dim).transpose(1, 2).reshape(-1, hidden_dim)
+                k = k.reshape(-1, hidden_dim)
+                v = v.reshape(-1, hidden_dim)
+
+            return [q.contiguous(), k.contiguous(), v.contiguous()]
+
         return super()._weight_to_hf_format(mcore_weights_name, mcore_weights)
 
     def _build_config(self):
