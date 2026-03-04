@@ -238,11 +238,14 @@ class Qwen3_5ForConditionalGeneration(Qwen3NextForCausalLM):
         num_k, num_v = cfg.linear_num_key_heads, cfg.linear_num_value_heads
         dk, dv = cfg.linear_key_head_dim, cfg.linear_value_head_dim
         v_per_k = num_v // num_k
-        q, k, v = torch.split(qkv_weight, [num_k*dk, num_k*dk, num_v*dv], dim=0)
-        q = q.view(num_k, dk, -1)
-        k = k.view(num_k, dk, -1)
-        v = v.view(num_k, v_per_k * dv, -1)
-        z = z_weight.view(num_k, v_per_k * dv, -1)
+        # Infer actual group count (handles TP sharding)
+        qkv_group = dk + dk + v_per_k * dv
+        actual_k = qkv_weight.shape[0] // qkv_group
+        q, k, v = torch.split(qkv_weight, [actual_k*dk, actual_k*dk, actual_k*v_per_k*dv], dim=0)
+        q = q.view(actual_k, dk, -1)
+        k = k.view(actual_k, dk, -1)
+        v = v.view(actual_k, v_per_k * dv, -1)
+        z = z_weight.view(actual_k, v_per_k * dv, -1)
         return torch.cat([q, k, v, z], dim=1).reshape(-1, qkv_weight.shape[1]).contiguous()
 
     def _split_qkvz(self, qkvz_weight):
@@ -252,9 +255,10 @@ class Qwen3_5ForConditionalGeneration(Qwen3NextForCausalLM):
         dk, dv = cfg.linear_key_head_dim, cfg.linear_value_head_dim
         v_per_k = num_v // num_k
         hidden = qkvz_weight.shape[1]
-        # Grouped layout: per group [dk, dk, v_per_k*dv, v_per_k*dv]
         group_size = dk + dk + v_per_k * dv + v_per_k * dv
-        groups = qkvz_weight.view(num_k, group_size, hidden)
+        # Infer actual group count (handles TP sharding)
+        actual_k = qkvz_weight.shape[0] // group_size
+        groups = qkvz_weight.view(actual_k, group_size, hidden)
         q = groups[:, :dk, :].reshape(-1, hidden)
         k = groups[:, dk:2*dk, :].reshape(-1, hidden)
         v = groups[:, 2*dk:2*dk + v_per_k*dv, :].reshape(-1, hidden)
@@ -266,8 +270,10 @@ class Qwen3_5ForConditionalGeneration(Qwen3NextForCausalLM):
         cfg = self.config
         num_k = cfg.linear_num_key_heads
         v_per_k = cfg.linear_num_value_heads // num_k
-        b = b_weight.view(num_k, v_per_k, -1)
-        a = a_weight.view(num_k, v_per_k, -1)
+        # Infer actual group count (handles TP sharding)
+        actual_k = b_weight.shape[0] // v_per_k
+        b = b_weight.view(actual_k, v_per_k, -1)
+        a = a_weight.view(actual_k, v_per_k, -1)
         return torch.cat([b, a], dim=1).reshape(-1, b_weight.shape[1]).contiguous()
 
     def _split_ba(self, ba_weight):
@@ -276,7 +282,8 @@ class Qwen3_5ForConditionalGeneration(Qwen3NextForCausalLM):
         num_k = cfg.linear_num_key_heads
         v_per_k = cfg.linear_num_value_heads // num_k
         hidden = ba_weight.shape[1]
-        groups = ba_weight.view(num_k, 2 * v_per_k, hidden)
+        actual_k = ba_weight.shape[0] // (2 * v_per_k)
+        groups = ba_weight.view(actual_k, 2 * v_per_k, hidden)
         b = groups[:, :v_per_k, :].reshape(-1, hidden)
         a = groups[:, v_per_k:, :].reshape(-1, hidden)
         return b.contiguous(), a.contiguous()
