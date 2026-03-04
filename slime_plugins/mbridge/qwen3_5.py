@@ -300,7 +300,8 @@ class Qwen3_5Bridge(Qwen2MoEBridge):
                 k = k.reshape(-1, hidden_dim)
                 v = v.reshape(-1, hidden_dim)
 
-            return [q.contiguous(), k.contiguous(), v.contiguous()]
+            hf_names = self._weight_name_mapping_mcore_to_hf(mcore_weights_name)
+            return hf_names, [q.contiguous(), k.contiguous(), v.contiguous()]
 
         return super()._weight_to_hf_format(mcore_weights_name, mcore_weights)
 
