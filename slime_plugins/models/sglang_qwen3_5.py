@@ -168,7 +168,12 @@ class Qwen3_5ForConditionalGeneration(Qwen3NextForCausalLM):
         return super().load_weights(self._transform_weights(weights), is_mtp=is_mtp)
 
     def _transform_weights(self, weights):
-        pending_qkv, pending_z, pending_b, pending_a = {}, {}, {}, {}
+        # Use persistent buffers so paired projections that land in different
+        # weight-update chunks can still be merged.  On initial load all pairs
+        # arrive in a single call, so the buffers drain immediately.
+        if not hasattr(self, "_buf_qkv"):
+            self._buf_qkv, self._buf_z = {}, {}
+            self._buf_b, self._buf_a = {}, {}
 
         for name, weight in weights:
             # Skip visual/VLM-only weights not present in the text model
@@ -185,53 +190,30 @@ class Qwen3_5ForConditionalGeneration(Qwen3NextForCausalLM):
             layer = int(m.group(1)) if m else None
 
             if ".linear_attn.in_proj_qkv." in name:
-                pending_qkv[layer] = weight
+                self._buf_qkv[layer] = weight
                 continue
             if ".linear_attn.in_proj_z." in name:
-                pending_z[layer] = weight
+                self._buf_z[layer] = weight
                 continue
             if ".linear_attn.in_proj_b." in name:
-                pending_b[layer] = weight
+                self._buf_b[layer] = weight
                 continue
             if ".linear_attn.in_proj_a." in name:
-                pending_a[layer] = weight
+                self._buf_a[layer] = weight
                 continue
 
             yield name, weight
 
-        # Merge buffered projections. During RL weight updates, weights arrive
-        # in chunks so a layer's QKV and Z may land in different calls. When
-        # one half is missing, read the current value from the model.
-        all_qkvz_layers = set(pending_qkv) | set(pending_z)
-        for layer in sorted(all_qkvz_layers):
-            qkv = pending_qkv.get(layer)
-            z = pending_z.get(layer)
-            if qkv is None or z is None:
-                cur = self._get_param(f"model.layers.{layer}.linear_attn.in_proj_qkvz.weight")
-                cur_qkv, cur_z = self._split_qkvz(cur)
-                qkv = qkv if qkv is not None else cur_qkv
-                z = z if z is not None else cur_z
+        # Yield merged projections only when both halves are available.
+        complete = set(self._buf_qkv) & set(self._buf_z)
+        for layer in sorted(complete):
             yield f"model.layers.{layer}.linear_attn.in_proj_qkvz.weight", \
-                self._merge_qkvz(qkv, z)
+                self._merge_qkvz(self._buf_qkv.pop(layer), self._buf_z.pop(layer))
 
-        all_ba_layers = set(pending_b) | set(pending_a)
-        for layer in sorted(all_ba_layers):
-            b = pending_b.get(layer)
-            a = pending_a.get(layer)
-            if b is None or a is None:
-                cur = self._get_param(f"model.layers.{layer}.linear_attn.in_proj_ba.weight")
-                cur_b, cur_a = self._split_ba(cur)
-                b = b if b is not None else cur_b
-                a = a if a is not None else cur_a
+        complete = set(self._buf_b) & set(self._buf_a)
+        for layer in sorted(complete):
             yield f"model.layers.{layer}.linear_attn.in_proj_ba.weight", \
-                self._merge_ba(b, a)
-
-    def _get_param(self, name: str) -> torch.Tensor:
-        """Look up an existing model parameter by name."""
-        for n, p in self.named_parameters():
-            if n == name:
-                return p.data
-        raise KeyError(f"Parameter {name} not found in model")
+                self._merge_ba(self._buf_b.pop(layer), self._buf_a.pop(layer))
 
     def _merge_qkvz(self, qkv_weight, z_weight):
         cfg = self.config
@@ -248,24 +230,6 @@ class Qwen3_5ForConditionalGeneration(Qwen3NextForCausalLM):
         z = z_weight.view(actual_k, v_per_k * dv, -1)
         return torch.cat([q, k, v, z], dim=1).reshape(-1, qkv_weight.shape[1]).contiguous()
 
-    def _split_qkvz(self, qkvz_weight):
-        """Reverse of _merge_qkvz: split interleaved [Q_g,K_g,V_g,Z_g] back to flat [Q,K,V] and [Z]."""
-        cfg = self.config
-        num_k, num_v = cfg.linear_num_key_heads, cfg.linear_num_value_heads
-        dk, dv = cfg.linear_key_head_dim, cfg.linear_value_head_dim
-        v_per_k = num_v // num_k
-        hidden = qkvz_weight.shape[1]
-        group_size = dk + dk + v_per_k * dv + v_per_k * dv
-        # Infer actual group count (handles TP sharding)
-        actual_k = qkvz_weight.shape[0] // group_size
-        groups = qkvz_weight.view(actual_k, group_size, hidden)
-        q = groups[:, :dk, :].reshape(-1, hidden)
-        k = groups[:, dk:2*dk, :].reshape(-1, hidden)
-        v = groups[:, 2*dk:2*dk + v_per_k*dv, :].reshape(-1, hidden)
-        z = groups[:, 2*dk + v_per_k*dv:, :].reshape(-1, hidden)
-        qkv = torch.cat([q, k, v], dim=0).contiguous()
-        return qkv, z.contiguous()
-
     def _merge_ba(self, b_weight, a_weight):
         cfg = self.config
         num_k = cfg.linear_num_key_heads
@@ -275,18 +239,6 @@ class Qwen3_5ForConditionalGeneration(Qwen3NextForCausalLM):
         b = b_weight.view(actual_k, v_per_k, -1)
         a = a_weight.view(actual_k, v_per_k, -1)
         return torch.cat([b, a], dim=1).reshape(-1, b_weight.shape[1]).contiguous()
-
-    def _split_ba(self, ba_weight):
-        """Reverse of _merge_ba: split interleaved [B_g,A_g] back to flat [B] and [A]."""
-        cfg = self.config
-        num_k = cfg.linear_num_key_heads
-        v_per_k = cfg.linear_num_value_heads // num_k
-        hidden = ba_weight.shape[1]
-        actual_k = ba_weight.shape[0] // (2 * v_per_k)
-        groups = ba_weight.view(actual_k, 2 * v_per_k, hidden)
-        b = groups[:, :v_per_k, :].reshape(-1, hidden)
-        a = groups[:, v_per_k:, :].reshape(-1, hidden)
-        return b.contiguous(), a.contiguous()
 
 
 EntryClass = Qwen3_5ForConditionalGeneration
