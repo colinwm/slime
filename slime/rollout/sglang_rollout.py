@@ -240,6 +240,7 @@ async def rescore_logprobs(args: Namespace, sample: Sample) -> Sample:
         rescored = [item[0] for item in input_logprobs if item is not None]
         if len(rescored) >= sample.response_length:
             sample.rollout_log_probs = rescored[: sample.response_length]
+            logger.info(f"Rescored {sample.response_length} logprobs via prefill (got {len(rescored)} from engine)")
         else:
             logger.warning(
                 f"Rescore returned {len(rescored)} logprobs, expected {sample.response_length}. "
