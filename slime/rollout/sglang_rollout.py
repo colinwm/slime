@@ -233,17 +233,24 @@ async def rescore_logprobs(args: Namespace, sample: Sample) -> Sample:
     try:
         output = await post(url, payload)
         input_logprobs = output["meta_info"]["input_token_logprobs"]
-        # input_token_logprobs is a list of [logprob, token_id] pairs.
-        # With logprob_start_len=prompt_length, the first entry corresponds to the
-        # first response token (conditioned on the prompt). Extract exactly
-        # response_length logprobs.
-        rescored = [item[0] for item in input_logprobs if item is not None]
+        # input_token_logprobs is a list with one entry per input token.
+        # Entries before logprob_start_len are None. Entries at or after
+        # logprob_start_len are [logprob, token_id] pairs. Extract the
+        # valid logprob values for the response tokens.
+        rescored = []
+        for item in input_logprobs:
+            if item is None:
+                continue
+            val = item[0] if isinstance(item, (list, tuple)) else item
+            if val is not None:
+                rescored.append(float(val))
         if len(rescored) >= sample.response_length:
             sample.rollout_log_probs = rescored[: sample.response_length]
             logger.info(f"Rescored {sample.response_length} logprobs via prefill (got {len(rescored)} from engine)")
         else:
             logger.warning(
                 f"Rescore returned {len(rescored)} logprobs, expected {sample.response_length}. "
+                f"input_logprobs has {len(input_logprobs)} entries, first 5: {input_logprobs[:5]}. "
                 "Keeping original decode logprobs."
             )
     except Exception:
