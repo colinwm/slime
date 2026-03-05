@@ -905,6 +905,16 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "If not set, we will use the logprobs from the actor model."
                 ),
             )
+            parser.add_argument(
+                "--rescore-rollout-logprobs",
+                action="store_true",
+                default=False,
+                help=(
+                    "After generation, rescore rollout logprobs via a prefill-only pass through the "
+                    "inference engine. This uses chunk-parallel attention instead of recurrent decode, "
+                    "reducing numerical divergence for linear attention models (e.g., Qwen3.5)."
+                ),
+            )
             # Off-Policy Correction using Importance Sampling: https://fengyao.notion.site/off-policy-rl
             parser.add_argument(
                 "--use-tis",

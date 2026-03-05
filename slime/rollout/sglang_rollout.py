@@ -205,6 +205,52 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
     return sample
 
 
+async def rescore_logprobs(args: Namespace, sample: Sample) -> Sample:
+    """Rescore rollout logprobs via a prefill-only pass through the inference engine.
+
+    For linear attention models, decode-time logprobs use recurrent mode while training
+    uses chunk-parallel mode, causing numerical divergence. This rescoring pass sends the
+    full sequence back through sglang as a prefill request, using chunk-parallel attention
+    to produce logprobs consistent with training.
+    """
+    if sample.response_length == 0 or not sample.tokens:
+        return sample
+
+    url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
+    prompt_length = len(sample.tokens) - sample.response_length
+
+    payload = {
+        "input_ids": sample.tokens,
+        "sampling_params": {
+            "temperature": 0,
+            "max_new_tokens": 0,
+            "skip_special_tokens": False,
+        },
+        "return_logprob": True,
+        "logprob_start_len": prompt_length,
+    }
+
+    try:
+        output = await post(url, payload)
+        input_logprobs = output["meta_info"]["input_token_logprobs"]
+        # input_token_logprobs is a list of [logprob, token_id] pairs.
+        # With logprob_start_len=prompt_length, the first entry corresponds to the
+        # first response token (conditioned on the prompt). Extract exactly
+        # response_length logprobs.
+        rescored = [item[0] for item in input_logprobs if item is not None]
+        if len(rescored) >= sample.response_length:
+            sample.rollout_log_probs = rescored[: sample.response_length]
+        else:
+            logger.warning(
+                f"Rescore returned {len(rescored)} logprobs, expected {sample.response_length}. "
+                "Keeping original decode logprobs."
+            )
+    except Exception:
+        logger.warning("Rescore logprobs failed, keeping original decode logprobs.", exc_info=True)
+
+    return sample
+
+
 async def generate_and_rm(
     args: Namespace,
     sample: Sample | list[Sample],
@@ -243,6 +289,14 @@ async def generate_and_rm(
                     sample = await custom_generate_func(args, sample, sampling_params)
             else:
                 sample = await generate(args, sample, sampling_params)
+
+    # Rescore logprobs via prefill to match chunk-parallel attention used in training
+    if args.rescore_rollout_logprobs and not evaluation:
+        if isinstance(sample, list):
+            for s in sample:
+                await rescore_logprobs(args, s)
+        else:
+            await rescore_logprobs(args, sample)
 
     # for the rm that need the whole group, we will not do the rm here
     if args.group_rm:
