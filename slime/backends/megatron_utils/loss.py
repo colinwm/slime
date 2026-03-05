@@ -797,6 +797,31 @@ def policy_loss_function(
         rollout_log_probs = torch.cat(batch["rollout_log_probs"], dim=0)
         train_rollout_logprob_abs_diff = sum_of_sample_mean((old_log_probs - rollout_log_probs).abs())
 
+        # --- Per-token logprob diagnostic (emit once) ---
+        if not getattr(args, "_logprob_diag_emitted", False) and mpu.get_tensor_model_parallel_rank() == 0:
+            args._logprob_diag_emitted = True
+            n = min(50, old_log_probs.shape[0])
+            # old_log_probs = training forward, rollout_log_probs = sglang inference
+            tokens_flat = torch.cat(batch["unconcat_tokens"], dim=0)
+            resp_offset = batch["total_lengths"][0] - batch["response_lengths"][0]
+            resp_tokens = tokens_flat[resp_offset : resp_offset + batch["response_lengths"][0]]
+            print(f"[LOGPROB_DIAG] sample 0: total_len={batch['total_lengths'][0]} resp_len={batch['response_lengths'][0]}")
+            print(f"[LOGPROB_DIAG] first {n} response tokens: {resp_tokens[:n].tolist()}")
+            for i in range(n):
+                t = old_log_probs[i].item()
+                r = rollout_log_probs[i].item()
+                tid = resp_tokens[i].item() if i < len(resp_tokens) else -1
+                print(f"[LOGPROB_DIAG] tok[{i}] id={tid:6d}  train={t:+.6f}  rollout={r:+.6f}  diff={t-r:+.6f}")
+            # Also emit the overall per-sample mean abs diff for all samples
+            per_sample_diffs = []
+            offset = 0
+            for rl in batch["response_lengths"]:
+                chunk = (old_log_probs[offset:offset+rl] - rollout_log_probs[offset:offset+rl]).abs().mean()
+                per_sample_diffs.append(chunk.item())
+                offset += rl
+            print(f"[LOGPROB_DIAG] per-sample mean abs diffs: {per_sample_diffs[:8]}")
+        # --- End diagnostic ---
+
     reported_loss = {
         "loss": loss.clone().detach(),
         "pg_loss": pg_loss.clone().detach(),
