@@ -219,6 +219,10 @@ async def rescore_logprobs(args: Namespace, sample: Sample) -> Sample:
     url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
     prompt_length = len(sample.tokens) - sample.response_length
 
+    # Start one position before the response so that the first response token
+    # gets a valid logprob (sglang always returns None for the first position
+    # in the logprob range).
+    logprob_start = max(prompt_length - 1, 0)
     payload = {
         "input_ids": sample.tokens,
         "sampling_params": {
@@ -227,18 +231,19 @@ async def rescore_logprobs(args: Namespace, sample: Sample) -> Sample:
             "skip_special_tokens": False,
         },
         "return_logprob": True,
-        "logprob_start_len": prompt_length,
+        "logprob_start_len": logprob_start,
     }
 
     try:
         output = await post(url, payload)
         input_logprobs = output["meta_info"]["input_token_logprobs"]
-        # input_token_logprobs is a list with one entry per input token.
-        # Entries before logprob_start_len are None. Entries at or after
-        # logprob_start_len are [logprob, token_id] pairs. Extract the
-        # valid logprob values for the response tokens.
+        # input_token_logprobs entries: the first entry (at logprob_start) always
+        # has None logprob. We started one position early, so skip entries for
+        # positions before the response and any None-valued logprobs.
+        extra_prefix = prompt_length - logprob_start
+        response_logprobs = input_logprobs[extra_prefix:]
         rescored = []
-        for item in input_logprobs:
+        for item in response_logprobs:
             if item is None:
                 continue
             val = item[0] if isinstance(item, (list, tuple)) else item
@@ -250,7 +255,8 @@ async def rescore_logprobs(args: Namespace, sample: Sample) -> Sample:
         else:
             logger.warning(
                 f"Rescore returned {len(rescored)} logprobs, expected {sample.response_length}. "
-                f"input_logprobs has {len(input_logprobs)} entries, first 5: {input_logprobs[:5]}. "
+                f"input_logprobs has {len(input_logprobs)} entries, extra_prefix={extra_prefix}, "
+                f"first 5 response entries: {response_logprobs[:5]}. "
                 "Keeping original decode logprobs."
             )
     except Exception:
